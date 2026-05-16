@@ -2,6 +2,9 @@
  * @file    AdvanceGame.c
  * @author  Lucky
  * @date    2026-5-15
+ *
+ *  Input system: raw-mode line editor with ←→ cursor movement,
+ *  Backspace/Delete, UTF-8 & CJK support.
  */
 
 #include <dirent.h>
@@ -9,7 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include <time.h>
+#include <unistd.h>
 
 #define MKDIR(p) mkdir(p, 0755)
 
@@ -25,10 +30,12 @@
 #define MAX_SKILL 100
 #define MAX_TASK 100
 #define MAX_RETRO_FILES 365
-#define FNAME_LEN 32 /* "YYYY-MM-DD.md" = 14 ，留足余量 */
+#define FNAME_LEN 32
 #define BAR_WIDTH 20
+#define MAX_DISPLAY_TASK 5
+#define EDIT_BUF_SIZE 256
 
-/* ANSI 颜色 */
+/* ANSI colors */
 #define C_RED 31
 #define C_GREEN 32
 #define C_YELLOW 33
@@ -58,7 +65,7 @@ typedef struct {
 
 typedef struct {
     char name[MAX_NAME];
-    int skill_idx; /* 关联技能索引，-1 = 无 */
+    int skill_idx;
     time_t start_time;
     time_t deadline;
     int difficulty;
@@ -76,11 +83,6 @@ static Task tasks[MAX_TASK];
 static const char* WEEKDAY_CN[] = {"周日", "周一", "周二", "周三",
                                    "周四", "周五", "周六"};
 
-/*
- * 默认模板 —— 首次运行时写入 retrospectives/template.md。
- * 用户可以自行编辑该文件，只要保留 {DATE} 即可。
- * 也可以加入 {WEEKDAY} 等占位符。
- */
 static const char* DEFAULT_TEMPLATE =
     "# {DATE} ({WEEKDAY}) 每日复盘\n"
     "\n"
@@ -105,34 +107,251 @@ static const char* DEFAULT_TEMPLATE =
     "\n"
     "> 任何想记录的想法、灵感、感悟...\n";
 
-/* ───────────────────────────── Terminal / I/O helpers ──────────────── */
+/* ───────────────────────────── Terminal helpers ────────────────────── */
 
 static void term_clear(void) { printf("\033[2J\033[H"); }
 static void term_color(int c) { printf("\033[%dm", c); }
+static void term_bold(void) { printf("\033[1m"); }
 static void term_reset(void) { printf("\033[0m"); }
 
-/**
- * 消耗 stdin 中剩余字符直到换行或 EOF。
- * @return 0 正常，-1 遇到 EOF（主循环应退出）
- */
-static int flush_stdin(void) {
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF);
-    return (c == EOF) ? -1 : 0;
+/* ───────────────────────────── UTF-8 helpers ───────────────────────── */
+
+static int utf8_len(unsigned char first) {
+    if (first < 0x80) return 1;
+    if ((first & 0xE0) == 0xC0) return 2;
+    if ((first & 0xF0) == 0xE0) return 3;
+    if ((first & 0xF8) == 0xF0) return 4;
+    return 1;
 }
 
-static int read_line(char* buf, int size) {
-    if (!fgets(buf, size, stdin)) return -1;
-    buf[strcspn(buf, "\n")] = '\0';
-    return 0;
-}
-
-static int read_int(int* out) {
-    if (scanf("%d", out) != 1) {
-        flush_stdin();
-        return -1;
+static int utf8_width(const char* s, int bytes) {
+    if (bytes <= 2) return 1;
+    if (bytes == 3) {
+        unsigned char c = (unsigned char)s[0];
+        if (c >= 0xE4 && c <= 0xE9) return 2;                   /* CJK */
+        if (c == 0xEF && (unsigned char)s[1] >= 0xBC) return 2; /* fullwidth */
+        return 1;
     }
-    flush_stdin();
+    return 2; /* 4-byte emoji etc. */
+}
+
+static int str_display_width(const char* buf, int start, int end) {
+    int w = 0;
+    for (int i = start; i < end;) {
+        int cl = utf8_len((unsigned char)buf[i]);
+        w += utf8_width(buf + i, cl);
+        i += cl;
+    }
+    return w;
+}
+
+/* ───────────────────────────── Raw-mode line editor ────────────────── */
+
+/**
+ * 终端原始模式行编辑器。
+ * 支持：←→ 移动光标、Backspace 删除前一个字符、Delete 删除当前字符、
+ *       中英文混排、Ctrl-C 取消。
+ * @return 0 正常提交, -1 取消/EOF
+ */
+static int read_line_raw(char* buf, int size) {
+    struct termios oldt, raw;
+    tcgetattr(STDIN_FILENO, &oldt);
+    raw = oldt;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_iflag &= ~(IXON | ICRNL);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+
+    int len = 0, pos = 0;
+    buf[0] = '\0';
+
+    while (1) {
+        fflush(stdout);
+        int c = getchar();
+        if (c == EOF) goto fail;
+
+        /* ── Enter ── */
+        if (c == '\n' || c == '\r') break;
+
+        /* ── Ctrl-C ── */
+        if (c == 0x03) goto fail;
+
+        /* ── Backspace (0x7F or 0x08) ── */
+        if (c == 0x7F || c == 0x08) {
+            if (pos <= 0) continue;
+
+            /* find start of previous UTF-8 char */
+            int p = pos - 1;
+            while (p > 0 && ((unsigned char)buf[p] & 0xC0) == 0x80) p--;
+            int dlen = pos - p;
+            int dw = utf8_width(buf + p, dlen);
+
+            /* move cursor back over deleted char */
+            for (int i = 0; i < dw; i++) putchar('\b');
+
+            int old_tw = str_display_width(buf, p, len);
+
+            /* remove from buffer */
+            memmove(buf + p, buf + pos, len - pos);
+            len -= dlen;
+            pos = p;
+            buf[len] = '\0';
+
+            /* redraw tail */
+            int new_tw = 0;
+            for (int i = pos; i < len;) {
+                int cl = utf8_len((unsigned char)buf[i]);
+                fwrite(buf + i, 1, cl, stdout);
+                new_tw += utf8_width(buf + i, cl);
+                i += cl;
+            }
+            /* clear leftover */
+            int extra = old_tw - new_tw;
+            for (int i = 0; i < extra; i++) putchar(' ');
+            /* move cursor back to pos */
+            for (int i = 0; i < new_tw + extra; i++) putchar('\b');
+            continue;
+        }
+
+        /* ── ESC sequences ── */
+        if (c == '\033') {
+            int next = getchar();
+            if (next == EOF) goto fail;
+            if (next == '[') {
+                int ch = getchar();
+                if (ch == EOF) goto fail;
+                switch (ch) {
+                    case 'A':
+                    case 'B':
+                        /* up/down: ignore */
+                        break;
+
+                    case 'C': /* → right */
+                        if (pos < len) {
+                            int cl = utf8_len((unsigned char)buf[pos]);
+                            fwrite(buf + pos, 1, cl, stdout);
+                            pos += cl;
+                        }
+                        break;
+
+                    case 'D': /* ← left */
+                        if (pos > 0) {
+                            int p = pos - 1;
+                            while (p > 0 &&
+                                   ((unsigned char)buf[p] & 0xC0) == 0x80)
+                                p--;
+                            int dw = utf8_width(buf + p, pos - p);
+                            for (int i = 0; i < dw; i++) putchar('\b');
+                            pos = p;
+                        }
+                        break;
+
+                    case '3': { /* Delete (ESC [ 3 ~) */
+                        int tilde = getchar();
+                        if (tilde == EOF) goto fail;
+                        if (pos >= len) break;
+
+                        int dlen = utf8_len((unsigned char)buf[pos]);
+                        int old_tw = str_display_width(buf, pos, len);
+
+                        memmove(buf + pos, buf + pos + dlen, len - pos - dlen);
+                        len -= dlen;
+                        buf[len] = '\0';
+
+                        int new_tw = 0;
+                        for (int i = pos; i < len;) {
+                            int cl = utf8_len((unsigned char)buf[i]);
+                            fwrite(buf + i, 1, cl, stdout);
+                            new_tw += utf8_width(buf + i, cl);
+                            i += cl;
+                        }
+                        int extra = old_tw - new_tw;
+                        for (int i = 0; i < extra; i++) putchar(' ');
+                        for (int i = 0; i < new_tw + extra; i++) putchar('\b');
+                        break;
+                    }
+                    default:
+                        /* consume remaining CSI params */
+                        if (ch >= 0x30 && ch <= 0x3F)
+                            while ((ch = getchar()) != EOF && ch >= 0x20 &&
+                                   ch < 0x40);
+                        break;
+                }
+            } else if (next == 'O') {
+                getchar(); /* SS3 sequence terminator */
+            }
+            continue;
+        }
+
+        /* ── Printable: ASCII or UTF-8 multi-byte start ── */
+        if ((c >= 0x20 && c < 0x7F) || (c >= 0xC0 && c <= 0xF7)) {
+            char chbuf[4];
+            int clen;
+
+            if (c < 0x80) {
+                clen = 1;
+                chbuf[0] = (char)c;
+            } else if ((c & 0xE0) == 0xC0) {
+                clen = 2;
+                chbuf[0] = (char)c;
+                for (int i = 1; i < 2; i++) {
+                    int b = getchar();
+                    if (b == EOF) goto fail;
+                    chbuf[i] = (char)b;
+                }
+            } else if ((c & 0xF0) == 0xE0) {
+                clen = 3;
+                chbuf[0] = (char)c;
+                for (int i = 1; i < 3; i++) {
+                    int b = getchar();
+                    if (b == EOF) goto fail;
+                    chbuf[i] = (char)b;
+                }
+            } else {
+                clen = 4;
+                chbuf[0] = (char)c;
+                for (int i = 1; i < 4; i++) {
+                    int b = getchar();
+                    if (b == EOF) goto fail;
+                    chbuf[i] = (char)b;
+                }
+            }
+
+            if (len + clen >= size) continue;
+
+            /* insert at cursor */
+            memmove(buf + pos + clen, buf + pos, len - pos);
+            memcpy(buf + pos, chbuf, clen);
+            len += clen;
+            buf[len] = '\0';
+
+            /* redraw from insert point to end */
+            for (int i = pos; i < len; i++) putchar(buf[i]);
+            pos += clen;
+
+            /* move cursor back to correct position */
+            int back = str_display_width(buf, pos, len);
+            for (int i = 0; i < back; i++) putchar('\b');
+        }
+    }
+
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+    putchar('\n');
+    return 0;
+
+fail:
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+    putchar('\n');
+    return -1;
+}
+
+/** read_int: 用 read_line_raw 读一行，再解析为整数 */
+static int read_int(int* out) {
+    char buf[32];
+    if (read_line_raw(buf, sizeof(buf)) == -1 || buf[0] == '\0') return -1;
+    char* end;
+    long val = strtol(buf, &end, 10);
+    if (end == buf) return -1;
+    *out = (int)val;
     return 0;
 }
 
@@ -202,7 +421,24 @@ static void Welcome(void) {
     printf("\n");
 }
 
+/* task display sort: undone first, then deadline, then importance, then
+ * difficulty */
+static int cmp_task_display(const void* pa, const void* pb) {
+    int a = *(const int*)pa, b = *(const int*)pb;
+
+    if (tasks[a].done != tasks[b].done) return tasks[a].done - tasks[b].done;
+
+    if (tasks[a].deadline != tasks[b].deadline)
+        return (tasks[a].deadline > tasks[b].deadline) ? 1 : -1;
+
+    if (tasks[a].importance != tasks[b].importance)
+        return tasks[b].importance - tasks[a].importance;
+
+    return tasks[a].difficulty - tasks[b].difficulty;
+}
+
 static void DisplayInfo(void) {
+    /* Player info */
     term_color(C_CYAN);
     printf("\n  ┌─── Information ───────────────────────────┐\n");
     printf("  │  Name : %-34s│\n", player.name);
@@ -217,6 +453,7 @@ static void DisplayInfo(void) {
     printf("  └───────────────────────────────────────────┘\n");
     term_reset();
 
+    /* Skills */
     if (player.skill_count > 0) {
         term_color(C_PURPLE);
         printf("\n  ┌─── Skills ─────────────────────────────────┐\n");
@@ -227,29 +464,40 @@ static void DisplayInfo(void) {
         term_reset();
     }
 
-    // Task
+    /* Tasks */
     if (player.task_count > 0) {
-        printf("\n");
+        int indices[MAX_TASK];
+        for (int i = 0; i < player.task_count; i++) indices[i] = i;
+        qsort(indices, player.task_count, sizeof(int), cmp_task_display);
+
+        int show = player.task_count;
+        int hidden = 0;
+        if (show > MAX_DISPLAY_TASK) {
+            hidden = show - MAX_DISPLAY_TASK;
+            show = MAX_DISPLAY_TASK;
+        }
+
         term_color(C_YELLOW);
+        printf("\n  ┌─── Tasks (Top %d)", show);
+        if (hidden > 0) printf("  +%d more", hidden);
         printf(
-            "  ┌─── Tasks "
-            "──────────────────────────────────────────────────────────────────"
-            "───┐\n");
+            " ─────────────────────────────────────────────────────────────┐"
+            "\n");
         printf(
             "  │  #   Status  Name                Start        Deadline     "
             "Diff   Imp    Exp  │\n");
         printf(
             "  │  ─── ──────  ──────────────────  ──────────── ──────────── "
             "────── ────── ──── │\n");
-        for (int i = 0; i < player.task_count; i++) {
+
+        for (int si = 0; si < show; si++) {
+            int i = indices[si];
             char ds[16], dl[16];
             fmt_date(tasks[i].start_time, ds, sizeof(ds));
             fmt_date(tasks[i].deadline, dl, sizeof(dl));
 
-            /* 索引 */
             printf("  │  %-3d ", i);
 
-            /* 状态（带颜色） */
             if (tasks[i].done) {
                 term_color(C_GREEN);
                 printf(" [✓]    ");
@@ -259,16 +507,14 @@ static void DisplayInfo(void) {
             }
             term_color(C_YELLOW);
 
-            /* 名字 / 开始 / 截止 / 难度 / 重要性 / 经验 */
             printf("%-18s  %-12s %-12s %-6s %-6s %3d  │\n", tasks[i].name, ds,
                    dl, diff_str(tasks[i].difficulty),
                    imp_str(tasks[i].importance), tasks[i].exp_reward);
         }
+
         printf(
-            "  "
-            "└─────────────────────────────────────────────────────────────────"
-            "─"
-            "─────────────┘\n");
+            "  └────────────────────────────────────────────────────────────"
+            "───────────────────┘\n");
         term_reset();
     }
     printf("\n");
@@ -310,7 +556,6 @@ static void ShowTask(void) {
         return;
     }
 
-    /* ---- 表格 ---- */
     term_color(C_YELLOW);
     printf(
         "\n  ┌─── Tasks "
@@ -338,17 +583,16 @@ static void ShowTask(void) {
         }
         term_color(C_YELLOW);
 
-        printf("%-18s  %-12s %-12s %-6s %-6s %4d │\n", tasks[i].name, ds, dl,
+        printf("  %-18s  %-12s %-12s %-6s %-6s %4d │\n", tasks[i].name, ds, dl,
                diff_str(tasks[i].difficulty), imp_str(tasks[i].importance),
                tasks[i].exp_reward);
     }
     printf(
         "  "
         "└─────────────────────────────────────────────────────────────────────"
-        "─────────┘\n");
+        "──────────┘\n");
     term_reset();
 
-    /* ---- 完成任务 ---- */
     printf("  Enter task # to complete (-1 cancel): ");
     int idx;
     if (read_int(&idx) == -1 || idx == -1) return;
@@ -364,7 +608,6 @@ static void ShowTask(void) {
     tasks[idx].done = 1;
     player.exp += tasks[idx].exp_reward;
 
-    /* 关联技能也加经验 */
     if (tasks[idx].skill_idx >= 0 &&
         tasks[idx].skill_idx < player.skill_count) {
         skills[tasks[idx].skill_idx].exp += tasks[idx].exp_reward;
@@ -390,7 +633,7 @@ static void AddSkill(void) {
     }
     char name[MAX_NAME];
     printf("  Skill name: ");
-    if (read_line(name, sizeof(name)) == -1 || !name[0]) {
+    if (read_line_raw(name, sizeof(name)) == -1 || !name[0]) {
         printf("  Empty name.\n");
         return;
     }
@@ -454,16 +697,16 @@ static void AddTask(void) {
     t.skill_idx = -1;
 
     printf("  Task name: ");
-    if (read_line(t.name, sizeof(t.name)) == -1 || !t.name[0]) {
+    if (read_line_raw(t.name, sizeof(t.name)) == -1 || !t.name[0]) {
         printf("  Empty.\n");
         return;
     }
 
-    /* 可选：关联技能 */
+    /* optional: link to skill */
     if (player.skill_count > 0) {
         printf("  Link to skill? (y/n): ");
         char yn[8];
-        if (read_line(yn, sizeof(yn)) == -1) return;
+        if (read_line_raw(yn, sizeof(yn)) == -1) return;
         if (yn[0] == 'y' || yn[0] == 'Y') {
             for (int i = 0; i < player.skill_count; i++)
                 printf("    [%d] %s\n", i, skills[i].name);
@@ -474,10 +717,10 @@ static void AddTask(void) {
         }
     }
 
-    /* 截止日期 */
+    /* deadline */
     printf("  Deadline (YYYY-MM-DD): ");
     char dbuf[32];
-    if (read_line(dbuf, sizeof(dbuf)) == -1) return;
+    if (read_line_raw(dbuf, sizeof(dbuf)) == -1) return;
     int y, m, d;
     if (sscanf(dbuf, "%d-%d-%d", &y, &m, &d) != 3 || y < 1900 || m < 1 ||
         m > 12 || d < 1 || d > 31) {
@@ -492,7 +735,7 @@ static void AddTask(void) {
     dl.tm_isdst = -1;
     t.deadline = mktime(&dl);
 
-    /* 难度 & 重要性 */
+    /* difficulty & importance */
     printf("  Difficulty (1-Easy 2-Medium 3-Hard): ");
     if (read_int(&t.difficulty) == -1 || t.difficulty < 1 || t.difficulty > 3) {
         printf("  Invalid.\n");
@@ -504,7 +747,7 @@ static void AddTask(void) {
         return;
     }
 
-    /* 经验奖励 */
+    /* exp reward */
     printf("  Exp reward: ");
     if (read_int(&t.exp_reward) == -1 || t.exp_reward <= 0) {
         printf("  Invalid.\n");
@@ -545,18 +788,6 @@ static void DelTask(void) {
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  Retrospective — Markdown 文件系统
- *
- *  目录结构:
- *    retrospectives/
- *    ├── template.md        ← 用户可自定义的模板
- *    ├── 2026-05-13.md      ← 往日复盘
- *    ├── 2026-05-14.md
- *    └── 2026-05-15.md      ← 当日复盘
- *
- *  工作流:
- *    1. 用户输入 'ar' → 从模板生成当日 .md 文件
- *    2. 程序询问是否打开编辑器 → 用户在编辑器中填写内容
- *    3. 用户输入 'r'  → 在终端中浏览/查看已有复盘
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static void get_today_str(char* buf, int size) {
@@ -565,22 +796,20 @@ static void get_today_str(char* buf, int size) {
     strftime(buf, size, "%Y-%m-%d", t);
 }
 
-/** 确保 retrospectives/ 目录存在 */
 static int ensure_retro_dir(void) {
     struct stat st;
-    if (stat(RETRO_DIR, &st) == 0) return 0; /* 已存在 */
-    if (MKDIR(RETRO_DIR) == 0) return 0;     /* 创建成功 */
+    if (stat(RETRO_DIR, &st) == 0) return 0;
+    if (MKDIR(RETRO_DIR) == 0) return 0;
     perror("  Cannot create " RETRO_DIR);
     return -1;
 }
 
-/** 确保模板文件存在，不存在则写入默认模板 */
 static int ensure_template(void) {
     FILE* fp = fopen(RETRO_TPL_FILE, "r");
     if (fp) {
         fclose(fp);
         return 0;
-    } /* 已存在 */
+    }
 
     fp = fopen(RETRO_TPL_FILE, "w");
     if (!fp) {
@@ -593,9 +822,6 @@ static int ensure_template(void) {
     return 0;
 }
 
-/**
- * 将模板中的 {DATE} 和 {WEEKDAY} 替换为实际值，写入 out。
- */
 static void apply_template(char* out, int out_size, const char* tpl,
                            const char* date, const char* weekday) {
     int pos = 0;
@@ -621,37 +847,19 @@ static void apply_template(char* out, int out_size, const char* tpl,
     out[pos] = '\0';
 }
 
-/**
- * 用系统默认编辑器打开文件。
- * 优先使用 $EDITOR 环境变量，否则按平台选择。
- */
 static int open_in_editor(const char* filepath) {
     char cmd[MAX_PATH_LEN + 64];
     const char* editor = getenv("EDITOR");
 
-    if (editor && editor[0]) {
+    if (editor && editor[0])
         snprintf(cmd, sizeof(cmd), "%s \"%s\"", editor, filepath);
-    } else {
-#ifdef _WIN32
-        snprintf(cmd, sizeof(cmd), "notepad \"%s\"", filepath);
-#elif defined(__APPLE__)
-        snprintf(cmd, sizeof(cmd), "open -t \"%s\"", filepath);
-#else
-        snprintf(cmd, sizeof(cmd), "nano \"%s\"", filepath);
-#endif
-    }
+    else
+        snprintf(cmd, sizeof(cmd), "vim \"%s\"", filepath);
+
     printf("  Opening editor... (close editor to return)\n");
     return system(cmd);
 }
 
-/**
- * 扫描 retrospectives/ 目录中的 .md 文件（排除 template.md）。
- * 结果按文件名降序排列（即最新日期在前）。
- *
- * @param list  输出文件名数组
- * @param max   数组容量
- * @return      找到的文件数量
- */
 static int scan_retro_files(char list[][FNAME_LEN], int max) {
     DIR* dir = opendir(RETRO_DIR);
     if (!dir) return 0;
@@ -671,7 +879,7 @@ static int scan_retro_files(char list[][FNAME_LEN], int max) {
     }
     closedir(dir);
 
-    /* 冒泡排序：降序，最新日期排在最前面 */
+    /* sort descending */
     for (int i = 0; i < count - 1; i++)
         for (int j = i + 1; j < count; j++)
             if (strcmp(list[i], list[j]) < 0) {
@@ -684,12 +892,6 @@ static int scan_retro_files(char list[][FNAME_LEN], int max) {
     return count;
 }
 
-/**
- * 通用的复盘文件选择器：列出文件 → 用户选择 → 输出完整路径。
- * @param out      输出缓冲区（完整路径）
- * @param out_size 缓冲区大小
- * @return         0 成功，-1 取消/无文件
- */
 static int pick_retro_file(char* out, int out_size) {
     if (ensure_retro_dir() == -1) return -1;
 
@@ -704,7 +906,6 @@ static int pick_retro_file(char* out, int out_size) {
     term_color(C_PURPLE);
     printf("\n  ┌─── Retrospectives ────────────────────────┐\n");
     for (int i = 0; i < count; i++) {
-        /* 去掉 .md 后缀做显示 */
         char label[FNAME_LEN];
         strcpy(label, files[i]);
         label[strlen(label) - 3] = '\0';
@@ -725,13 +926,10 @@ static int pick_retro_file(char* out, int out_size) {
     return 0;
 }
 
-/**
- * 终端 Markdown 简易渲染器。
- * 对 # / ## / --- / > 四种元素做彩色显示。
- */
 static void render_md_line(const char* line) {
     if (strncmp(line, "# ", 2) == 0) {
         term_color(C_YELLOW);
+        term_bold();
         printf("  ▎ %s\n", line + 2);
         term_reset();
     } else if (strncmp(line, "## ", 3) == 0) {
@@ -753,18 +951,9 @@ static void render_md_line(const char* line) {
     }
 }
 
-/**
- * ar — 生成当日复盘并可选打开编辑器。
- *
- * 流程:
- *   1. 确保目录和模板存在
- *   2. 如果今天的 .md 已存在 → 提示并询问是否打开编辑
- *   3. 如果不存在 → 读取模板，替换占位符，生成文件，询问是否打开编辑
- */
 static void AddRetrospective(void) {
     if (ensure_retro_dir() == -1) return;
 
-    /* 检查模板是否存在 */
     FILE* fp = fopen(RETRO_TPL_FILE, "r");
     if (!fp) {
         term_color(C_RED);
@@ -780,26 +969,22 @@ static void AddRetrospective(void) {
     char filepath[MAX_PATH_LEN];
     snprintf(filepath, sizeof(filepath), "%s/%s.md", RETRO_DIR, date);
 
-    /* 今天是否已生成 */
     FILE* check = fopen(filepath, "r");
     if (check) {
         fclose(check);
         printf("  Today's retrospective exists:\n    %s\n", filepath);
     } else {
-        /* 读取模板 */
         char tpl[MAX_LONG];
         int n = (int)fread(tpl, 1, sizeof(tpl) - 1, fp);
         tpl[n] = '\0';
         fclose(fp);
 
-        /* 替换占位符 */
         time_t now = time(NULL);
         struct tm* tm_now = localtime(&now);
         char content[MAX_LONG];
         apply_template(content, sizeof(content), tpl, date,
                        WEEKDAY_CN[tm_now->tm_wday]);
 
-        /* 写入 */
         FILE* out = fopen(filepath, "w");
         if (!out) {
             perror("  Cannot create file");
@@ -813,19 +998,15 @@ static void AddRetrospective(void) {
         term_reset();
     }
 
-    /* 询问打开编辑器 */
     printf("  Open in editor? (y/n): ");
     char yn[8];
-    if (read_line(yn, sizeof(yn)) != -1 && (yn[0] == 'y' || yn[0] == 'Y')) {
+    if (read_line_raw(yn, sizeof(yn)) != -1 && (yn[0] == 'y' || yn[0] == 'Y')) {
         open_in_editor(filepath);
         term_clear();
         DisplayInfo();
     }
 }
 
-/**
- * r — 浏览已有复盘（在终端中渲染 Markdown）。
- */
 static void ShowRetrospective(void) {
     char filepath[MAX_PATH_LEN];
     if (pick_retro_file(filepath, sizeof(filepath)) == -1) return;
@@ -849,16 +1030,13 @@ static void ShowRetrospective(void) {
     printf("\n");
 }
 
-/**
- * dr — 删除指定的复盘文件。
- */
 static void DelRetrospective(void) {
     char filepath[MAX_PATH_LEN];
     if (pick_retro_file(filepath, sizeof(filepath)) == -1) return;
 
     printf("  Delete %s? (y/n): ", filepath);
     char yn[8];
-    if (read_line(yn, sizeof(yn)) == -1 || (yn[0] != 'y' && yn[0] != 'Y')) {
+    if (read_line_raw(yn, sizeof(yn)) == -1 || (yn[0] != 'y' && yn[0] != 'Y')) {
         printf("  Cancelled.\n");
         return;
     }
@@ -893,7 +1071,6 @@ static void WriteDBFile(void) {
 static void ReadDBFile(void) {
     FILE* fp = fopen(DB_FILE, "rb");
     if (!fp) {
-        /* 首次运行 */
         strcpy(player.name, "Yu Lucky");
         strcpy(player.grade, "Sophomore");
         strcpy(player.major, "Integrated Circuit Design");
@@ -913,7 +1090,6 @@ static void ReadDBFile(void) {
         return;
     }
 
-    /* 防御损坏文件 */
     if (player.skill_count < 0 || player.skill_count > MAX_SKILL)
         player.skill_count = 0;
     if (player.task_count < 0 || player.task_count > MAX_TASK)
@@ -923,7 +1099,6 @@ static void ReadDBFile(void) {
         fread(skills, sizeof(Skill), player.skill_count, fp);
     if (player.task_count > 0)
         fread(tasks, sizeof(Task), player.task_count, fp);
-    /* 忽略旧版可能残留的 retro 数据（如有） */
 
     fclose(fp);
 }
@@ -936,64 +1111,27 @@ static void Quit(void) {
 
 /* ───────────────────────────── Input ───────────────────────────────── */
 
-/**
- * 读取一条命令。
- * 单字符命令: h / i / t / r / q
- * 双字符命令: as / at / ar / ds / dt / dr
- * @return 0 正常，-1 EOF
- */
 static int GetInput(char* input, char* target) {
     printf("  > ");
     fflush(stdout);
 
-    int c = getchar();
-    if (c == EOF) return -1;
+    char line[16];
+    if (read_line_raw(line, sizeof(line)) == -1) return -1;
 
-    /* 检测 ESC 转义序列（方向键等），直接吞掉 */
-    if (c == '\033') {
-        int next = getchar();
-        if (next == EOF) return -1;
-        if (next == '[') {
-            /* 标准 CSI 序列：ESC [ <参数字节...> <结尾字节> */
-            while (1) {
-                int ch = getchar();
-                if (ch == EOF) return -1;
-                /* 结尾字节范围 0x40-0x7E（A~Z, a~z, @, [, ], ^, _, {, |, } 等）
-                 */
-                if (ch >= 0x40 && ch <= 0x7E) break;
-            }
-        } else if (next == 'O') {
-            /* SS3 序列（部分终端用 ESC O A 表示方向键） */
-            int ch = getchar();
-            if (ch == EOF) return -1;
-        }
-        /* 转义序列已全部消费，当作无效输入，重新提示 */
+    if (line[0] == '\0') {
         *input = '\0';
         *target = '\0';
         return 0;
     }
 
-    *input = (char)c;
+    *input = line[0];
 
-    if (*input == '\n') {
-        *input = '\0';
+    if (*input == 'a' || *input == 'd')
+        *target = line[1] ? line[1] : '\0';
+    else
         *target = '\0';
-        return 0;
-    }
 
-    if (*input == 'a' || *input == 'd') {
-        c = getchar();
-        if (c == EOF) return -1;
-        *target = (char)c;
-        if (*target == '\n') {
-            *target = '\0';
-            return 0;
-        }
-    } else {
-        *target = '\0';
-    }
-
-    return flush_stdin();
+    return 0;
 }
 
 /* ───────────────────────────── Main ────────────────────────────────── */
@@ -1008,6 +1146,7 @@ int main(void) {
 
     while (1) {
         if (GetInput(&input, &target) == -1) break;
+        if (input == '\0') continue;
 
         switch (input) {
             case 'h':
@@ -1066,7 +1205,6 @@ int main(void) {
         }
     }
 
-    /* EOF — 自动保存退出 */
     WriteDBFile();
     printf("\n  EOF reached, data saved. Goodbye!\n");
     return 0;
